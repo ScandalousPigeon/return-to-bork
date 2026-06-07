@@ -80,6 +80,10 @@ public class RTBPlayer
 
 public class MazeSolver
 {
+    private const long ExactStateLimit = 5000000;
+    private const int MaximumExactTreasureCount = 20;
+    private const int UnreachableDistance = 1000000000;
+
     private bool learning = true;
 
     private Dictionary<string, Dictionary<string, string?>> graph;
@@ -111,10 +115,11 @@ public class MazeSolver
     {
         learning = false;
         plannedActions.Clear();
+        previousActionWasGo = false;
 
-        if (challengeType.StartsWith("100"))
+        if (IsHundredPercentChallenge())
         {
-            QueueTreasureRouteThenEgress(start, egress);
+            QueueCollectAllTreasuresRoute(start, egress);
         }
         else
         {
@@ -138,6 +143,11 @@ public class MazeSolver
 
         // This should normally only happen if the challenge has already been completed.
         return ("challenge", "");
+    }
+
+    private bool IsHundredPercentChallenge()
+    {
+        return challengeType.StartsWith("100");
     }
 
     private void RecordLocationAndExits(RTBLocation location)
@@ -164,10 +174,7 @@ public class MazeSolver
 
     private void AddKnownExitsFromLocation(RTBLocation location)
     {
-        if (!graph.ContainsKey(location.Name))
-        {
-            graph[location.Name] = new Dictionary<string, string?>();
-        }
+        EnsureLocationExists(location.Name);
 
         foreach (RTBExit exit in location.Exits)
         {
@@ -246,65 +253,327 @@ public class MazeSolver
         }
     }
 
-    private void QueueTreasureRouteThenEgress(string start, string egress)
+    /// <summary>
+    /// Maze 100% planner.
+    ///
+    /// For small/medium treasure counts, this uses a state-space BFS over
+    /// (location, collectedTreasureMask). Since every maze move has unit cost,
+    /// the first time BFS reaches (egress, allTreasures) is the true shortest
+    /// 100% route.
+    ///
+    /// If the treasure state space would be too large, it falls back to a fast
+    /// cheapest-insertion route over shortest-path distances. That fallback is
+    /// not guaranteed optimal, but is much stronger than nearest-treasure greedy
+    /// and protects the 100C tests from exponential blow-ups.
+    /// </summary>
+    private void QueueCollectAllTreasuresRoute(string start, string egress)
     {
-        string currentLocation = start;
-        HashSet<string> remainingTreasures = new HashSet<string>(treasureLocations);
+        List<string>? route;
 
-        remainingTreasures.Remove(currentLocation);
-
-        while (remainingTreasures.Count > 0)
+        if (CanUseExactCollectAllSearch())
         {
-            string? nearestTreasure = null;
-            List<string>? shortestTreasureRoute = null;
+            route = FindShortestCollectAllTreasuresRoute(start, egress);
+        }
+        else
+        {
+            route = FindCheapestInsertionTreasureRoute(start, egress);
+        }
 
-            foreach (string treasure in remainingTreasures)
+        if (route == null)
+        {
+            // Connected maze maps should not need this, but it avoids returning
+            // a second "challenge" command if something unexpected happens.
+            route = FindShortestExitSequence(start, egress);
+        }
+
+        if (route == null)
+        {
+            return;
+        }
+
+        foreach (string exit in route)
+        {
+            plannedActions.Enqueue(("go", exit));
+        }
+    }
+
+    private bool CanUseExactCollectAllSearch()
+    {
+        int treasureCount = treasureLocations.Count;
+
+        if (treasureCount > MaximumExactTreasureCount)
+        {
+            return false;
+        }
+
+        long estimatedStates = ((long)graph.Count) * (1L << treasureCount);
+        return estimatedStates <= ExactStateLimit;
+    }
+
+    private List<string>? FindShortestCollectAllTreasuresRoute(string start, string egress)
+    {
+        List<string> treasures = new List<string>(treasureLocations);
+        Dictionary<string, int> treasureIndex = new Dictionary<string, int>();
+
+        for (int i = 0; i < treasures.Count; i++)
+        {
+            treasureIndex[treasures[i]] = i;
+        }
+
+        int startMask = 0;
+        if (treasureIndex.ContainsKey(start))
+        {
+            startMask |= 1 << treasureIndex[start];
+        }
+
+        int goalMask = (1 << treasures.Count) - 1;
+        var startState = (location: start, mask: startMask);
+
+        Queue<(string location, int mask)> queue = new Queue<(string location, int mask)>();
+        HashSet<(string location, int mask)> visited = new HashSet<(string location, int mask)>();
+        Dictionary<(string location, int mask), PreviousMazeState> previous =
+            new Dictionary<(string location, int mask), PreviousMazeState>();
+
+        queue.Enqueue(startState);
+        visited.Add(startState);
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+
+            if (current.location == egress && current.mask == goalMask)
             {
-                List<string>? route = FindShortestExitSequence(currentLocation, treasure);
+                return BuildStateSpaceExitSequence(startState, current, previous);
+            }
 
-                if (route == null)
+            if (!graph.ContainsKey(current.location))
+            {
+                continue;
+            }
+
+            foreach (var exitEntry in graph[current.location])
+            {
+                string exit = exitEntry.Key;
+                string? destination = exitEntry.Value;
+
+                if (destination == null)
                 {
                     continue;
                 }
 
-                if (shortestTreasureRoute == null || route.Count < shortestTreasureRoute.Count)
+                int nextMask = current.mask;
+                if (treasureIndex.ContainsKey(destination))
                 {
-                    shortestTreasureRoute = route;
-                    nearestTreasure = treasure;
+                    nextMask |= 1 << treasureIndex[destination];
+                }
+
+                var nextState = (location: destination, mask: nextMask);
+                if (visited.Contains(nextState))
+                {
+                    continue;
+                }
+
+                visited.Add(nextState);
+                previous[nextState] = new PreviousMazeState(
+                    current.location,
+                    current.mask,
+                    exit
+                );
+                queue.Enqueue(nextState);
+            }
+        }
+
+        return null;
+    }
+
+    private List<string> BuildStateSpaceExitSequence(
+        (string location, int mask) startState,
+        (string location, int mask) goalState,
+        Dictionary<(string location, int mask), PreviousMazeState> previous)
+    {
+        List<string> reversedExitSequence = new List<string>();
+        var current = goalState;
+
+        while (!current.Equals(startState))
+        {
+            PreviousMazeState step = previous[current];
+            reversedExitSequence.Add(step.ExitUsed);
+            current = (location: step.PreviousLocation, mask: step.PreviousMask);
+        }
+
+        reversedExitSequence.Reverse();
+        return reversedExitSequence;
+    }
+
+    private List<string>? FindCheapestInsertionTreasureRoute(string start, string egress)
+    {
+        List<string> remainingTreasures = new List<string>();
+        foreach (string treasure in treasureLocations)
+        {
+            // The start treasure is picked up before the first challenge action.
+            // The egress treasure, if present, is picked up on the final arrival.
+            if (treasure != start && treasure != egress)
+            {
+                remainingTreasures.Add(treasure);
+            }
+        }
+
+        Dictionary<string, ShortestPathTree> shortestPaths = BuildShortestPathTrees(
+            start,
+            remainingTreasures
+        );
+
+        List<string> visitOrder = new List<string>();
+
+        while (remainingTreasures.Count > 0)
+        {
+            int bestTreasureIndex = -1;
+            int bestInsertPosition = 0;
+            int bestAddedDistance = int.MaxValue;
+
+            for (int treasureIndex = 0; treasureIndex < remainingTreasures.Count; treasureIndex++)
+            {
+                string treasure = remainingTreasures[treasureIndex];
+
+                for (int insertPosition = 0; insertPosition <= visitOrder.Count; insertPosition++)
+                {
+                    string previousLocation = insertPosition == 0
+                        ? start
+                        : visitOrder[insertPosition - 1];
+                    string nextLocation = insertPosition == visitOrder.Count
+                        ? egress
+                        : visitOrder[insertPosition];
+
+                    int addedDistance = Distance(shortestPaths, previousLocation, treasure)
+                        + Distance(shortestPaths, treasure, nextLocation)
+                        - Distance(shortestPaths, previousLocation, nextLocation);
+
+                    if (addedDistance < bestAddedDistance)
+                    {
+                        bestAddedDistance = addedDistance;
+                        bestTreasureIndex = treasureIndex;
+                        bestInsertPosition = insertPosition;
+                    }
                 }
             }
 
-            if (nearestTreasure == null || shortestTreasureRoute == null)
+            if (bestTreasureIndex < 0)
             {
-                break;
+                return null;
             }
 
-            foreach (string exit in shortestTreasureRoute)
-            {
-                plannedActions.Enqueue(("go", exit));
-            }
-
-            currentLocation = nearestTreasure;
-            remainingTreasures.Remove(nearestTreasure);
+            string chosenTreasure = remainingTreasures[bestTreasureIndex];
+            remainingTreasures.RemoveAt(bestTreasureIndex);
+            visitOrder.Insert(bestInsertPosition, chosenTreasure);
         }
 
-        QueueShortestRoute(currentLocation, egress);
+        return BuildRouteFromVisitOrder(start, egress, visitOrder);
+    }
+
+    private Dictionary<string, ShortestPathTree> BuildShortestPathTrees(
+        string start,
+        List<string> treasureSources)
+    {
+        Dictionary<string, ShortestPathTree> shortestPaths = new Dictionary<string, ShortestPathTree>();
+
+        shortestPaths[start] = RunBreadthFirstSearch(start);
+
+        foreach (string treasure in treasureSources)
+        {
+            if (!shortestPaths.ContainsKey(treasure))
+            {
+                shortestPaths[treasure] = RunBreadthFirstSearch(treasure);
+            }
+        }
+
+        return shortestPaths;
+    }
+
+    private int Distance(
+        Dictionary<string, ShortestPathTree> shortestPaths,
+        string start,
+        string goal)
+    {
+        if (!shortestPaths.ContainsKey(start))
+        {
+            shortestPaths[start] = RunBreadthFirstSearch(start);
+        }
+
+        int distance;
+        if (shortestPaths[start].TryGetDistance(goal, out distance))
+        {
+            return distance;
+        }
+
+        return UnreachableDistance;
+    }
+
+    private List<string>? BuildRouteFromVisitOrder(
+        string start,
+        string egress,
+        List<string> visitOrder)
+    {
+        List<string> fullRoute = new List<string>();
+        HashSet<string> alreadyCollected = new HashSet<string>();
+        string currentLocation = start;
+
+        if (treasureLocations.Contains(start))
+        {
+            alreadyCollected.Add(start);
+        }
+
+        List<string> waypoints = new List<string>(visitOrder);
+        waypoints.Add(egress);
+
+        foreach (string waypoint in waypoints)
+        {
+            bool isFinalEgress = waypoint == egress;
+
+            if (!isFinalEgress && alreadyCollected.Contains(waypoint))
+            {
+                continue;
+            }
+
+            List<string>? routeSegment = FindShortestExitSequence(currentLocation, waypoint);
+            if (routeSegment == null)
+            {
+                return null;
+            }
+
+            foreach (string exit in routeSegment)
+            {
+                fullRoute.Add(exit);
+
+                string? nextLocation = FindKnownDestination(currentLocation, exit);
+                if (nextLocation == null)
+                {
+                    return null;
+                }
+
+                currentLocation = nextLocation;
+                if (treasureLocations.Contains(currentLocation))
+                {
+                    alreadyCollected.Add(currentLocation);
+                }
+            }
+        }
+
+        return fullRoute;
     }
 
     private List<string>? FindShortestExitSequence(string start, string goal)
     {
-        if (start == goal)
-        {
-            return new List<string>();
-        }
+        return RunBreadthFirstSearch(start).BuildExitSequence(goal);
+    }
 
+    private ShortestPathTree RunBreadthFirstSearch(string start)
+    {
         Queue<string> queue = new Queue<string>();
-        HashSet<string> visited = new HashSet<string>();
-        Dictionary<string, (string previousLocation, string exitUsed)> previousSteps =
-            new Dictionary<string, (string previousLocation, string exitUsed)>();
+        Dictionary<string, int> distances = new Dictionary<string, int>();
+        Dictionary<string, PreviousStep> previousSteps = new Dictionary<string, PreviousStep>();
 
         queue.Enqueue(start);
-        visited.Add(start);
+        distances[start] = 0;
 
         while (queue.Count > 0)
         {
@@ -320,49 +589,36 @@ public class MazeSolver
                 string exit = exitEntry.Key;
                 string? destination = exitEntry.Value;
 
-                if (destination == null)
+                if (destination == null || distances.ContainsKey(destination))
                 {
                     continue;
                 }
 
-                if (visited.Contains(destination))
-                {
-                    continue;
-                }
-
-                visited.Add(destination);
-                previousSteps[destination] = (currentLocation, exit);
-
-                if (destination == goal)
-                {
-                    return BuildExitSequence(start, goal, previousSteps);
-                }
-
+                distances[destination] = distances[currentLocation] + 1;
+                previousSteps[destination] = new PreviousStep(currentLocation, exit);
                 queue.Enqueue(destination);
             }
         }
 
-        return null;
+        return new ShortestPathTree(start, distances, previousSteps);
     }
 
-    private List<string> BuildExitSequence(
-        string start,
-        string goal,
-        Dictionary<string, (string previousLocation, string exitUsed)> previousSteps)
+    private string? FindKnownDestination(string location, string exit)
     {
-        List<string> reversedExitSequence = new List<string>();
-        string currentLocation = goal;
-
-        while (currentLocation != start)
+        if (!graph.ContainsKey(location) || !graph[location].ContainsKey(exit))
         {
-            var step = previousSteps[currentLocation];
-
-            reversedExitSequence.Add(step.exitUsed);
-            currentLocation = step.previousLocation;
+            return null;
         }
 
-        reversedExitSequence.Reverse();
-        return reversedExitSequence;
+        return graph[location][exit];
+    }
+
+    private void EnsureLocationExists(string location)
+    {
+        if (!graph.ContainsKey(location))
+        {
+            graph[location] = new Dictionary<string, string?>();
+        }
     }
 
     private (string, string) ReturnActionAndRememberExit(
@@ -381,6 +637,75 @@ public class MazeSolver
         }
 
         return action;
+    }
+
+    private readonly struct PreviousMazeState
+    {
+        public readonly string PreviousLocation;
+        public readonly int PreviousMask;
+        public readonly string ExitUsed;
+
+        public PreviousMazeState(string previousLocation, int previousMask, string exitUsed)
+        {
+            PreviousLocation = previousLocation;
+            PreviousMask = previousMask;
+            ExitUsed = exitUsed;
+        }
+    }
+
+    private readonly struct PreviousStep
+    {
+        public readonly string PreviousLocation;
+        public readonly string ExitUsed;
+
+        public PreviousStep(string previousLocation, string exitUsed)
+        {
+            PreviousLocation = previousLocation;
+            ExitUsed = exitUsed;
+        }
+    }
+
+    private class ShortestPathTree
+    {
+        private string start;
+        private Dictionary<string, int> distances;
+        private Dictionary<string, PreviousStep> previousSteps;
+
+        public ShortestPathTree(
+            string start,
+            Dictionary<string, int> distances,
+            Dictionary<string, PreviousStep> previousSteps)
+        {
+            this.start = start;
+            this.distances = distances;
+            this.previousSteps = previousSteps;
+        }
+
+        public bool TryGetDistance(string goal, out int distance)
+        {
+            return distances.TryGetValue(goal, out distance);
+        }
+
+        public List<string>? BuildExitSequence(string goal)
+        {
+            if (!distances.ContainsKey(goal))
+            {
+                return null;
+            }
+
+            List<string> reversedExitSequence = new List<string>();
+            string currentLocation = goal;
+
+            while (currentLocation != start)
+            {
+                PreviousStep step = previousSteps[currentLocation];
+                reversedExitSequence.Add(step.ExitUsed);
+                currentLocation = step.PreviousLocation;
+            }
+
+            reversedExitSequence.Reverse();
+            return reversedExitSequence;
+        }
     }
 }
 
