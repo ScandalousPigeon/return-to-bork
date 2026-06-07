@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ReturnToBork")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+cc5723dc8ed46bc3216c206c39e0da40d5e89170")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f10c7a54d9fc031c097a4e9889cde2a5fa3ac9ef")]
 [assembly: System.Reflection.AssemblyProductAttribute("ReturnToBork")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ReturnToBork")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
