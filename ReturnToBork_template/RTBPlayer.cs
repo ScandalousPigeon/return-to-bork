@@ -12,6 +12,7 @@ public class RTBPlayer
     private TrollsAnyPercentChallenge trollsAnyPercent;
     private Trolls100PercentChallenge trolls100Percent;
     private KeysAnyPercentChallenge keysAnyPercent;
+    private Ropes100PercentChallenge ropes100Percent;
 
     public RTBPlayer(string mapType, string challengeType)
     {
@@ -23,6 +24,7 @@ public class RTBPlayer
         trollsAnyPercent = new TrollsAnyPercentChallenge();
         trolls100Percent = new Trolls100PercentChallenge();
         keysAnyPercent = new KeysAnyPercentChallenge(challengeType);
+        ropes100Percent = new Ropes100PercentChallenge();
     }
 
     public void SetChallenge(string start, string egress)
@@ -44,6 +46,10 @@ public class RTBPlayer
         else if (MapType == "Keys" && IsAnyPercentChallenge())
         {
             keysAnyPercent.PrepareChallengeRoute(start, egress);
+        }
+        else if (MapType == "Ropes" && IsHundredPercentChallenge())
+        {
+            ropes100Percent.PrepareChallengeRoute(start, egress);
         }
     }
 
@@ -88,6 +94,18 @@ public class RTBPlayer
         if (MapType == "Keys" && IsAnyPercentChallenge())
         {
             var action = keysAnyPercent.ChooseNextAction(location);
+
+            if (action.Item1 == "challenge")
+            {
+                Learning = false;
+            }
+
+            return action;
+        }
+
+        if (MapType == "Ropes" && IsHundredPercentChallenge())
+        {
+            var action = ropes100Percent.ChooseNextAction(location);
 
             if (action.Item1 == "challenge")
             {
@@ -2591,6 +2609,1662 @@ public class Trolls100PercentChallenge
         public override int GetHashCode()
         {
             return HashCode.Combine(Coins, Moves);
+        }
+    }
+}
+
+/// <summary>
+/// Solves Ropes 100% by learning the full map, compressing toll-free/rope-free
+/// locations into areas, choosing a minimum-rope set of river bridges connecting
+/// the start area, egress area, and all treasure areas, then walking that tree.
+/// Rope is only paid the first time a river bridge is built, so this planner
+/// optimises the set of bridges rather than the number of crossings.
+/// </summary>
+public class Ropes100PercentChallenge
+{
+    private const int MaximumExactSteinerTerminalCount = 15;
+    private const int MaximumExactLocalTreasureCount = 14;
+    private const int Infinity = 1000000000;
+
+    private bool learning = true;
+
+    private Dictionary<string, Dictionary<string, LearnedRopeExit>> graph;
+    private HashSet<string> treasureLocations;
+    private Queue<(string command, string exit)> learningActions;
+    private Queue<(string command, string exit)> challengeActions;
+
+    private string? learningStart;
+    private string? previousLocation;
+    private string? previousExit;
+    private int previousRopeCost;
+    private bool previousActionWasGo;
+
+    public Ropes100PercentChallenge()
+    {
+        graph = new Dictionary<string, Dictionary<string, LearnedRopeExit>>();
+        treasureLocations = new HashSet<string>();
+        learningActions = new Queue<(string command, string exit)>();
+        challengeActions = new Queue<(string command, string exit)>();
+
+        learningStart = null;
+        previousLocation = null;
+        previousExit = null;
+        previousRopeCost = 0;
+        previousActionWasGo = false;
+    }
+
+    public (string, string) ChooseNextAction(RTBLocation location)
+    {
+        RecordLocationAndExits(location);
+
+        if (learning)
+        {
+            if (learningActions.Count > 0)
+            {
+                return ReturnActionAndRememberExit(learningActions.Dequeue(), location);
+            }
+
+            return ChooseLearningAction(location);
+        }
+
+        if (challengeActions.Count > 0)
+        {
+            return ReturnActionAndRememberExit(challengeActions.Dequeue(), location);
+        }
+
+        return ("challenge", "");
+    }
+
+    public void PrepareChallengeRoute(string start, string egress)
+    {
+        learning = false;
+        challengeActions.Clear();
+        previousActionWasGo = false;
+
+        List<string>? route = BuildRopes100Route(start, egress);
+
+        if (route == null)
+        {
+            route = FindShortestKnownExitSequence(start, egress);
+        }
+
+        if (route == null)
+        {
+            return;
+        }
+
+        foreach (string exit in route)
+        {
+            challengeActions.Enqueue(("go", exit));
+        }
+    }
+
+    private void RecordLocationAndExits(RTBLocation location)
+    {
+        if (learningStart == null)
+        {
+            learningStart = location.Name;
+        }
+
+        AddKnownExitsFromLocation(location);
+
+        if (location.Treasure)
+        {
+            treasureLocations.Add(location.Name);
+        }
+
+        if (previousActionWasGo && previousLocation != null && previousExit != null)
+        {
+            EnsureLocationExists(previousLocation);
+
+            if (!graph[previousLocation].ContainsKey(previousExit))
+            {
+                graph[previousLocation][previousExit] =
+                    new LearnedRopeExit(previousExit, previousRopeCost, location.Name);
+            }
+            else
+            {
+                graph[previousLocation][previousExit].RopeCost = previousRopeCost;
+                graph[previousLocation][previousExit].Destination = location.Name;
+            }
+        }
+
+        previousActionWasGo = false;
+    }
+
+    private void AddKnownExitsFromLocation(RTBLocation location)
+    {
+        EnsureLocationExists(location.Name);
+
+        foreach (RTBExit exit in location.Exits)
+        {
+            if (!graph[location.Name].ContainsKey(exit.Name))
+            {
+                graph[location.Name][exit.Name] = new LearnedRopeExit(exit.Name, exit.RopeCost, null);
+            }
+            else
+            {
+                graph[location.Name][exit.Name].RopeCost = exit.RopeCost;
+            }
+        }
+    }
+
+    private (string, string) ChooseLearningAction(RTBLocation location)
+    {
+        var unknownExit = FindExitWithUnknownDestination();
+
+        if (unknownExit == null)
+        {
+            learning = false;
+            return ("challenge", "");
+        }
+
+        string targetLocation = unknownExit.Value.location;
+        string exitToExplore = unknownExit.Value.exit;
+
+        List<string>? routeToTarget = FindShortestKnownExitSequence(location.Name, targetLocation);
+
+        if (routeToTarget == null)
+        {
+            return ("reset", "");
+        }
+
+        foreach (string exit in routeToTarget)
+        {
+            learningActions.Enqueue(("go", exit));
+        }
+
+        learningActions.Enqueue(("go", exitToExplore));
+        learningActions.Enqueue(("reset", ""));
+
+        return ReturnActionAndRememberExit(learningActions.Dequeue(), location);
+    }
+
+    private (string location, string exit)? FindExitWithUnknownDestination()
+    {
+        foreach (var locationEntry in graph)
+        {
+            string location = locationEntry.Key;
+            Dictionary<string, LearnedRopeExit> exits = locationEntry.Value;
+
+            foreach (var exitEntry in exits)
+            {
+                string exit = exitEntry.Key;
+                LearnedRopeExit exitInfo = exitEntry.Value;
+
+                if (exitInfo.Destination == null)
+                {
+                    return (location, exit);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private List<string>? BuildRopes100Route(string start, string egress)
+    {
+        AreaModel model = BuildAreaModel();
+
+        if (!model.LocationToArea.ContainsKey(start) || !model.LocationToArea.ContainsKey(egress))
+        {
+            return null;
+        }
+
+        int startArea = model.LocationToArea[start];
+        int egressArea = model.LocationToArea[egress];
+        HashSet<int> requiredAreas = FindRequiredAreas(model, startArea, egressArea);
+
+        HashSet<int>? selectedEdgeIds;
+        if (requiredAreas.Count <= 1)
+        {
+            selectedEdgeIds = new HashSet<int>();
+        }
+        else if (requiredAreas.Count == model.AreaCount)
+        {
+            selectedEdgeIds = FindMinimumSpanningTreeEdges(model, startArea);
+        }
+        else if (requiredAreas.Count <= MaximumExactSteinerTerminalCount)
+        {
+            selectedEdgeIds = FindExactSteinerTreeEdges(model, requiredAreas);
+        }
+        else
+        {
+            selectedEdgeIds = FindGreedySteinerTreeEdges(model, startArea, requiredAreas);
+        }
+
+        if (selectedEdgeIds == null)
+        {
+            return null;
+        }
+
+        List<AreaTransition>? areaWalk = BuildAreaWalkFromSelectedEdges(
+            model,
+            startArea,
+            egressArea,
+            requiredAreas,
+            selectedEdgeIds
+        );
+
+        if (areaWalk == null)
+        {
+            return null;
+        }
+
+        return BuildLocationRouteFromAreaWalk(model, start, egress, areaWalk);
+    }
+
+    private AreaModel BuildAreaModel()
+    {
+        AreaModel model = new AreaModel();
+
+        foreach (string location in graph.Keys)
+        {
+            if (model.LocationToArea.ContainsKey(location))
+            {
+                continue;
+            }
+
+            int areaId = model.Areas.Count;
+            List<string> areaLocations = new List<string>();
+            Queue<string> queue = new Queue<string>();
+
+            model.Areas.Add(areaLocations);
+            model.LocationToArea[location] = areaId;
+            queue.Enqueue(location);
+
+            while (queue.Count > 0)
+            {
+                string current = queue.Dequeue();
+                areaLocations.Add(current);
+
+                if (!graph.ContainsKey(current))
+                {
+                    continue;
+                }
+
+                foreach (LearnedRopeExit exit in graph[current].Values)
+                {
+                    if (exit.Destination == null || exit.RopeCost != 0)
+                    {
+                        continue;
+                    }
+
+                    if (model.LocationToArea.ContainsKey(exit.Destination))
+                    {
+                        continue;
+                    }
+
+                    model.LocationToArea[exit.Destination] = areaId;
+                    queue.Enqueue(exit.Destination);
+                }
+            }
+        }
+
+        for (int i = 0; i < model.Areas.Count; i++)
+        {
+            model.Adjacency.Add(new List<AreaEdge>());
+        }
+
+        Dictionary<string, AreaEdge> bestEdgesByAreaPair = new Dictionary<string, AreaEdge>();
+
+        foreach (var locationEntry in graph)
+        {
+            string fromLocation = locationEntry.Key;
+            if (!model.LocationToArea.ContainsKey(fromLocation))
+            {
+                continue;
+            }
+
+            int fromArea = model.LocationToArea[fromLocation];
+
+            foreach (LearnedRopeExit exit in locationEntry.Value.Values)
+            {
+                if (exit.Destination == null || exit.RopeCost == 0)
+                {
+                    continue;
+                }
+
+                if (!model.LocationToArea.ContainsKey(exit.Destination))
+                {
+                    continue;
+                }
+
+                int toArea = model.LocationToArea[exit.Destination];
+                if (fromArea == toArea)
+                {
+                    continue;
+                }
+
+                LearnedRopeExit? reverseExit = FindReverseExit(exit.Destination, fromLocation, exit.RopeCost);
+                if (reverseExit == null)
+                {
+                    continue;
+                }
+
+                AreaTransition forward = new AreaTransition(
+                    fromArea,
+                    toArea,
+                    fromLocation,
+                    exit.Name,
+                    exit.Destination,
+                    exit.RopeCost
+                );
+
+                AreaTransition backward = new AreaTransition(
+                    toArea,
+                    fromArea,
+                    exit.Destination,
+                    reverseExit.Name,
+                    fromLocation,
+                    exit.RopeCost
+                );
+
+                int areaA = Math.Min(fromArea, toArea);
+                int areaB = Math.Max(fromArea, toArea);
+                string key = AreaPairKey(areaA, areaB);
+
+                AreaTransition aToB = fromArea == areaA ? forward : backward;
+                AreaTransition bToA = fromArea == areaA ? backward : forward;
+
+                if (!bestEdgesByAreaPair.ContainsKey(key) ||
+                    exit.RopeCost < bestEdgesByAreaPair[key].RopeCost)
+                {
+                    bestEdgesByAreaPair[key] = new AreaEdge(
+                        -1,
+                        areaA,
+                        areaB,
+                        exit.RopeCost,
+                        aToB,
+                        bToA
+                    );
+                }
+            }
+        }
+
+        foreach (AreaEdge edge in bestEdgesByAreaPair.Values)
+        {
+            edge.Id = model.Edges.Count;
+            model.Edges.Add(edge);
+            model.Adjacency[edge.AreaA].Add(edge);
+            model.Adjacency[edge.AreaB].Add(edge);
+        }
+
+        return model;
+    }
+
+    private string AreaPairKey(int areaA, int areaB)
+    {
+        return areaA + ":" + areaB;
+    }
+
+    private LearnedRopeExit? FindReverseExit(string fromLocation, string toLocation, int ropeCost)
+    {
+        if (!graph.ContainsKey(fromLocation))
+        {
+            return null;
+        }
+
+        foreach (LearnedRopeExit exit in graph[fromLocation].Values)
+        {
+            if (exit.Destination == toLocation && exit.RopeCost == ropeCost)
+            {
+                return exit;
+            }
+        }
+
+        return null;
+    }
+
+    private HashSet<int> FindRequiredAreas(AreaModel model, int startArea, int egressArea)
+    {
+        HashSet<int> requiredAreas = new HashSet<int>();
+        requiredAreas.Add(startArea);
+        requiredAreas.Add(egressArea);
+
+        foreach (string treasure in treasureLocations)
+        {
+            if (model.LocationToArea.ContainsKey(treasure))
+            {
+                requiredAreas.Add(model.LocationToArea[treasure]);
+            }
+        }
+
+        return requiredAreas;
+    }
+
+    private HashSet<int>? FindMinimumSpanningTreeEdges(AreaModel model, int startArea)
+    {
+        HashSet<int> selectedEdges = new HashSet<int>();
+        HashSet<int> visited = new HashSet<int>();
+        PriorityQueue<AreaEdge, AreaEdgeCost> queue = new PriorityQueue<AreaEdge, AreaEdgeCost>();
+
+        visited.Add(startArea);
+        foreach (AreaEdge edge in model.Adjacency[startArea])
+        {
+            queue.Enqueue(edge, new AreaEdgeCost(edge.RopeCost, edge.Id));
+        }
+
+        while (queue.Count > 0 && visited.Count < model.AreaCount)
+        {
+            queue.TryDequeue(out AreaEdge? edge, out AreaEdgeCost cost);
+            if (edge == null)
+            {
+                continue;
+            }
+
+            int nextArea;
+            if (visited.Contains(edge.AreaA) && !visited.Contains(edge.AreaB))
+            {
+                nextArea = edge.AreaB;
+            }
+            else if (visited.Contains(edge.AreaB) && !visited.Contains(edge.AreaA))
+            {
+                nextArea = edge.AreaA;
+            }
+            else
+            {
+                continue;
+            }
+
+            selectedEdges.Add(edge.Id);
+            visited.Add(nextArea);
+
+            foreach (AreaEdge nextEdge in model.Adjacency[nextArea])
+            {
+                int other = nextEdge.Other(nextArea);
+                if (!visited.Contains(other))
+                {
+                    queue.Enqueue(nextEdge, new AreaEdgeCost(nextEdge.RopeCost, nextEdge.Id));
+                }
+            }
+        }
+
+        if (visited.Count != model.AreaCount)
+        {
+            return null;
+        }
+
+        return selectedEdges;
+    }
+
+    private HashSet<int>? FindExactSteinerTreeEdges(AreaModel model, HashSet<int> requiredAreas)
+    {
+        List<int> terminals = new List<int>(requiredAreas);
+        int terminalCount = terminals.Count;
+        int areaCount = model.AreaCount;
+        int maskCount = 1 << terminalCount;
+        int fullMask = maskCount - 1;
+
+        int[,] cost = new int[maskCount, areaCount];
+        int[,] parentType = new int[maskCount, areaCount];
+        int[,] parentA = new int[maskCount, areaCount];
+        int[,] parentB = new int[maskCount, areaCount];
+
+        for (int mask = 0; mask < maskCount; mask++)
+        {
+            for (int area = 0; area < areaCount; area++)
+            {
+                cost[mask, area] = Infinity;
+                parentType[mask, area] = 0;
+                parentA[mask, area] = -1;
+                parentB[mask, area] = -1;
+            }
+        }
+
+        for (int i = 0; i < terminalCount; i++)
+        {
+            int mask = 1 << i;
+            int terminalArea = terminals[i];
+            cost[mask, terminalArea] = 0;
+            parentType[mask, terminalArea] = 1;
+        }
+
+        for (int mask = 1; mask < maskCount; mask++)
+        {
+            for (int submask = (mask - 1) & mask; submask > 0; submask = (submask - 1) & mask)
+            {
+                int otherMask = mask ^ submask;
+                if (otherMask == 0 || submask > otherMask)
+                {
+                    continue;
+                }
+
+                for (int area = 0; area < areaCount; area++)
+                {
+                    if (cost[submask, area] == Infinity || cost[otherMask, area] == Infinity)
+                    {
+                        continue;
+                    }
+
+                    long mergedCost = (long)cost[submask, area] + cost[otherMask, area];
+                    if (mergedCost < cost[mask, area])
+                    {
+                        cost[mask, area] = (int)mergedCost;
+                        parentType[mask, area] = 2;
+                        parentA[mask, area] = submask;
+                        parentB[mask, area] = otherMask;
+                    }
+                }
+            }
+
+            RunSteinerDijkstraForMask(model, mask, cost, parentType, parentA, parentB);
+        }
+
+        int bestRoot = -1;
+        int bestCost = Infinity;
+        for (int area = 0; area < areaCount; area++)
+        {
+            if (cost[fullMask, area] < bestCost)
+            {
+                bestCost = cost[fullMask, area];
+                bestRoot = area;
+            }
+        }
+
+        if (bestRoot < 0 || bestCost == Infinity)
+        {
+            return null;
+        }
+
+        HashSet<int> selectedEdges = new HashSet<int>();
+        AddSteinerEdges(fullMask, bestRoot, selectedEdges, parentType, parentA, parentB);
+        return selectedEdges;
+    }
+
+    private void RunSteinerDijkstraForMask(
+        AreaModel model,
+        int mask,
+        int[,] cost,
+        int[,] parentType,
+        int[,] parentA,
+        int[,] parentB)
+    {
+        PriorityQueue<int, AreaEdgeCost> queue = new PriorityQueue<int, AreaEdgeCost>();
+
+        for (int area = 0; area < model.AreaCount; area++)
+        {
+            if (cost[mask, area] < Infinity)
+            {
+                queue.Enqueue(area, new AreaEdgeCost(cost[mask, area], area));
+            }
+        }
+
+        while (queue.Count > 0)
+        {
+            queue.TryDequeue(out int currentArea, out AreaEdgeCost currentCost);
+
+            if (cost[mask, currentArea] != currentCost.RopeCost)
+            {
+                continue;
+            }
+
+            foreach (AreaEdge edge in model.Adjacency[currentArea])
+            {
+                int nextArea = edge.Other(currentArea);
+                long newCost = (long)currentCost.RopeCost + edge.RopeCost;
+
+                if (newCost < cost[mask, nextArea])
+                {
+                    cost[mask, nextArea] = (int)newCost;
+                    parentType[mask, nextArea] = 3;
+                    parentA[mask, nextArea] = currentArea;
+                    parentB[mask, nextArea] = edge.Id;
+                    queue.Enqueue(nextArea, new AreaEdgeCost((int)newCost, nextArea));
+                }
+            }
+        }
+    }
+
+    private void AddSteinerEdges(
+        int mask,
+        int area,
+        HashSet<int> selectedEdges,
+        int[,] parentType,
+        int[,] parentA,
+        int[,] parentB)
+    {
+        int type = parentType[mask, area];
+
+        if (type == 1)
+        {
+            return;
+        }
+
+        if (type == 2)
+        {
+            AddSteinerEdges(parentA[mask, area], area, selectedEdges, parentType, parentA, parentB);
+            AddSteinerEdges(parentB[mask, area], area, selectedEdges, parentType, parentA, parentB);
+            return;
+        }
+
+        if (type == 3)
+        {
+            selectedEdges.Add(parentB[mask, area]);
+            AddSteinerEdges(mask, parentA[mask, area], selectedEdges, parentType, parentA, parentB);
+        }
+    }
+
+    private HashSet<int>? FindGreedySteinerTreeEdges(
+        AreaModel model,
+        int startArea,
+        HashSet<int> requiredAreas)
+    {
+        HashSet<int> selectedEdges = new HashSet<int>();
+        HashSet<int> connectedAreas = new HashSet<int>();
+        connectedAreas.Add(startArea);
+
+        while (!AllRequiredAreasConnected(requiredAreas, connectedAreas))
+        {
+            List<int>? pathEdges = FindCheapestPathFromConnectedToRequired(
+                model,
+                connectedAreas,
+                requiredAreas
+            );
+
+            if (pathEdges == null)
+            {
+                return null;
+            }
+
+            foreach (int edgeId in pathEdges)
+            {
+                selectedEdges.Add(edgeId);
+                AreaEdge edge = model.Edges[edgeId];
+                connectedAreas.Add(edge.AreaA);
+                connectedAreas.Add(edge.AreaB);
+            }
+        }
+
+        return selectedEdges;
+    }
+
+    private bool AllRequiredAreasConnected(HashSet<int> requiredAreas, HashSet<int> connectedAreas)
+    {
+        foreach (int area in requiredAreas)
+        {
+            if (!connectedAreas.Contains(area))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private List<int>? FindCheapestPathFromConnectedToRequired(
+        AreaModel model,
+        HashSet<int> connectedAreas,
+        HashSet<int> requiredAreas)
+    {
+        int[] distance = new int[model.AreaCount];
+        int[] previousArea = new int[model.AreaCount];
+        int[] previousEdge = new int[model.AreaCount];
+        PriorityQueue<int, AreaEdgeCost> queue = new PriorityQueue<int, AreaEdgeCost>();
+
+        for (int area = 0; area < model.AreaCount; area++)
+        {
+            distance[area] = Infinity;
+            previousArea[area] = -1;
+            previousEdge[area] = -1;
+        }
+
+        foreach (int area in connectedAreas)
+        {
+            distance[area] = 0;
+            queue.Enqueue(area, new AreaEdgeCost(0, area));
+        }
+
+        int targetArea = -1;
+        while (queue.Count > 0)
+        {
+            queue.TryDequeue(out int currentArea, out AreaEdgeCost currentCost);
+
+            if (distance[currentArea] != currentCost.RopeCost)
+            {
+                continue;
+            }
+
+            if (requiredAreas.Contains(currentArea) && !connectedAreas.Contains(currentArea))
+            {
+                targetArea = currentArea;
+                break;
+            }
+
+            foreach (AreaEdge edge in model.Adjacency[currentArea])
+            {
+                int nextArea = edge.Other(currentArea);
+                int newCost = currentCost.RopeCost + edge.RopeCost;
+
+                if (newCost < distance[nextArea])
+                {
+                    distance[nextArea] = newCost;
+                    previousArea[nextArea] = currentArea;
+                    previousEdge[nextArea] = edge.Id;
+                    queue.Enqueue(nextArea, new AreaEdgeCost(newCost, nextArea));
+                }
+            }
+        }
+
+        if (targetArea < 0)
+        {
+            return null;
+        }
+
+        List<int> pathEdges = new List<int>();
+        int current = targetArea;
+        while (!connectedAreas.Contains(current))
+        {
+            if (previousArea[current] < 0 || previousEdge[current] < 0)
+            {
+                return null;
+            }
+
+            pathEdges.Add(previousEdge[current]);
+            current = previousArea[current];
+        }
+
+        return pathEdges;
+    }
+
+    private List<AreaTransition>? BuildAreaWalkFromSelectedEdges(
+        AreaModel model,
+        int startArea,
+        int egressArea,
+        HashSet<int> requiredAreas,
+        HashSet<int> selectedEdgeIds)
+    {
+        List<List<AreaEdge>> treeAdjacency = BuildSpanningTreeFromSelectedEdges(model, startArea, selectedEdgeIds);
+
+        foreach (int requiredArea in requiredAreas)
+        {
+            if (!AreaIsReachableInTree(treeAdjacency, startArea, requiredArea))
+            {
+                return null;
+            }
+        }
+
+        Dictionary<int, int>? nextOnPath = FindNextAreaOnPath(treeAdjacency, startArea, egressArea);
+        if (nextOnPath == null)
+        {
+            return null;
+        }
+
+        List<AreaTransition> walk = new List<AreaTransition>();
+
+        if (startArea == egressArea)
+        {
+            AppendReturnWalk(startArea, -1, treeAdjacency, walk);
+        }
+        else
+        {
+            AppendEgressWalk(startArea, -1, nextOnPath, treeAdjacency, walk);
+        }
+
+        return walk;
+    }
+
+    private List<List<AreaEdge>> BuildSpanningTreeFromSelectedEdges(
+        AreaModel model,
+        int startArea,
+        HashSet<int> selectedEdgeIds)
+    {
+        List<List<AreaEdge>> selectedAdjacency = new List<List<AreaEdge>>();
+        List<List<AreaEdge>> treeAdjacency = new List<List<AreaEdge>>();
+
+        for (int area = 0; area < model.AreaCount; area++)
+        {
+            selectedAdjacency.Add(new List<AreaEdge>());
+            treeAdjacency.Add(new List<AreaEdge>());
+        }
+
+        foreach (int edgeId in selectedEdgeIds)
+        {
+            AreaEdge edge = model.Edges[edgeId];
+            selectedAdjacency[edge.AreaA].Add(edge);
+            selectedAdjacency[edge.AreaB].Add(edge);
+        }
+
+        HashSet<int> visited = new HashSet<int>();
+        Queue<int> queue = new Queue<int>();
+        visited.Add(startArea);
+        queue.Enqueue(startArea);
+
+        while (queue.Count > 0)
+        {
+            int area = queue.Dequeue();
+
+            foreach (AreaEdge edge in selectedAdjacency[area])
+            {
+                int other = edge.Other(area);
+                if (visited.Contains(other))
+                {
+                    continue;
+                }
+
+                visited.Add(other);
+                queue.Enqueue(other);
+                treeAdjacency[area].Add(edge);
+                treeAdjacency[other].Add(edge);
+            }
+        }
+
+        return treeAdjacency;
+    }
+
+    private bool AreaIsReachableInTree(List<List<AreaEdge>> treeAdjacency, int startArea, int goalArea)
+    {
+        if (startArea == goalArea)
+        {
+            return true;
+        }
+
+        HashSet<int> visited = new HashSet<int>();
+        Queue<int> queue = new Queue<int>();
+        visited.Add(startArea);
+        queue.Enqueue(startArea);
+
+        while (queue.Count > 0)
+        {
+            int current = queue.Dequeue();
+            foreach (AreaEdge edge in treeAdjacency[current])
+            {
+                int next = edge.Other(current);
+                if (visited.Contains(next))
+                {
+                    continue;
+                }
+
+                if (next == goalArea)
+                {
+                    return true;
+                }
+
+                visited.Add(next);
+                queue.Enqueue(next);
+            }
+        }
+
+        return false;
+    }
+
+    private Dictionary<int, int>? FindNextAreaOnPath(
+        List<List<AreaEdge>> treeAdjacency,
+        int startArea,
+        int egressArea)
+    {
+        Dictionary<int, int> parent = new Dictionary<int, int>();
+        Queue<int> queue = new Queue<int>();
+        HashSet<int> visited = new HashSet<int>();
+
+        visited.Add(startArea);
+        queue.Enqueue(startArea);
+
+        while (queue.Count > 0)
+        {
+            int current = queue.Dequeue();
+            if (current == egressArea)
+            {
+                break;
+            }
+
+            foreach (AreaEdge edge in treeAdjacency[current])
+            {
+                int next = edge.Other(current);
+                if (visited.Contains(next))
+                {
+                    continue;
+                }
+
+                visited.Add(next);
+                parent[next] = current;
+                queue.Enqueue(next);
+            }
+        }
+
+        if (!visited.Contains(egressArea))
+        {
+            return null;
+        }
+
+        Dictionary<int, int> nextOnPath = new Dictionary<int, int>();
+        int areaOnPath = egressArea;
+
+        while (areaOnPath != startArea)
+        {
+            int previous = parent[areaOnPath];
+            nextOnPath[previous] = areaOnPath;
+            areaOnPath = previous;
+        }
+
+        return nextOnPath;
+    }
+
+    private void AppendReturnWalk(
+        int area,
+        int parentArea,
+        List<List<AreaEdge>> treeAdjacency,
+        List<AreaTransition> walk)
+    {
+        foreach (AreaEdge edge in treeAdjacency[area])
+        {
+            int child = edge.Other(area);
+            if (child == parentArea)
+            {
+                continue;
+            }
+
+            walk.Add(edge.GetTransitionFrom(area));
+            AppendReturnWalk(child, area, treeAdjacency, walk);
+            walk.Add(edge.GetTransitionFrom(child));
+        }
+    }
+
+    private void AppendEgressWalk(
+        int area,
+        int parentArea,
+        Dictionary<int, int> nextOnPath,
+        List<List<AreaEdge>> treeAdjacency,
+        List<AreaTransition> walk)
+    {
+        int nextPathArea = nextOnPath.ContainsKey(area) ? nextOnPath[area] : -1;
+
+        foreach (AreaEdge edge in treeAdjacency[area])
+        {
+            int child = edge.Other(area);
+            if (child == parentArea || child == nextPathArea)
+            {
+                continue;
+            }
+
+            walk.Add(edge.GetTransitionFrom(area));
+            AppendReturnWalk(child, area, treeAdjacency, walk);
+            walk.Add(edge.GetTransitionFrom(child));
+        }
+
+        if (nextPathArea >= 0)
+        {
+            AreaEdge? pathEdge = FindTreeEdge(treeAdjacency, area, nextPathArea);
+            if (pathEdge != null)
+            {
+                walk.Add(pathEdge.GetTransitionFrom(area));
+                AppendEgressWalk(nextPathArea, area, nextOnPath, treeAdjacency, walk);
+            }
+        }
+    }
+
+    private AreaEdge? FindTreeEdge(List<List<AreaEdge>> treeAdjacency, int areaA, int areaB)
+    {
+        foreach (AreaEdge edge in treeAdjacency[areaA])
+        {
+            if (edge.Other(areaA) == areaB)
+            {
+                return edge;
+            }
+        }
+
+        return null;
+    }
+
+    private List<string>? BuildLocationRouteFromAreaWalk(
+        AreaModel model,
+        string start,
+        string egress,
+        List<AreaTransition> areaWalk)
+    {
+        List<string> fullRoute = new List<string>();
+        HashSet<string> remainingTreasures = new HashSet<string>(treasureLocations);
+        string currentLocation = start;
+
+        remainingTreasures.Remove(currentLocation);
+
+        foreach (AreaTransition transition in areaWalk)
+        {
+            remainingTreasures.Remove(currentLocation);
+
+            List<string>? internalRoute = BuildInternalAreaRouteCollectingTreasures(
+                model,
+                currentLocation,
+                transition.FromLocation,
+                remainingTreasures
+            );
+
+            if (internalRoute == null)
+            {
+                return null;
+            }
+
+            AppendRouteAndUpdateTreasures(fullRoute, internalRoute, ref currentLocation, remainingTreasures);
+
+            if (currentLocation != transition.FromLocation)
+            {
+                return null;
+            }
+
+            fullRoute.Add(transition.ExitName);
+            currentLocation = transition.ToLocation;
+            remainingTreasures.Remove(currentLocation);
+        }
+
+        List<string>? finalRoute = BuildInternalAreaRouteCollectingTreasures(
+            model,
+            currentLocation,
+            egress,
+            remainingTreasures
+        );
+
+        if (finalRoute == null)
+        {
+            return null;
+        }
+
+        AppendRouteAndUpdateTreasures(fullRoute, finalRoute, ref currentLocation, remainingTreasures);
+        remainingTreasures.Remove(currentLocation);
+
+        if (currentLocation != egress)
+        {
+            return null;
+        }
+
+        if (remainingTreasures.Count > 0)
+        {
+            return null;
+        }
+
+        return fullRoute;
+    }
+
+    private List<string>? BuildInternalAreaRouteCollectingTreasures(
+        AreaModel model,
+        string start,
+        string target,
+        HashSet<string> remainingTreasures)
+    {
+        if (!model.LocationToArea.ContainsKey(start) || !model.LocationToArea.ContainsKey(target))
+        {
+            return null;
+        }
+
+        int area = model.LocationToArea[start];
+        if (model.LocationToArea[target] != area)
+        {
+            return null;
+        }
+
+        List<string> localTreasures = new List<string>();
+        foreach (string treasure in remainingTreasures)
+        {
+            if (model.LocationToArea.ContainsKey(treasure) && model.LocationToArea[treasure] == area)
+            {
+                localTreasures.Add(treasure);
+            }
+        }
+
+        if (localTreasures.Count == 0)
+        {
+            return FindShortestZeroRopeExitSequence(model, start, target);
+        }
+
+        if (localTreasures.Count <= MaximumExactLocalTreasureCount)
+        {
+            List<string>? exactRoute = FindShortestInternalCollectRoute(
+                model,
+                start,
+                target,
+                localTreasures
+            );
+
+            if (exactRoute != null)
+            {
+                return exactRoute;
+            }
+        }
+
+        return FindNearestInternalTreasureRoute(model, start, target, localTreasures);
+    }
+
+    private List<string>? FindShortestInternalCollectRoute(
+        AreaModel model,
+        string start,
+        string target,
+        List<string> localTreasures)
+    {
+        Dictionary<string, int> treasureIndex = new Dictionary<string, int>();
+        for (int i = 0; i < localTreasures.Count; i++)
+        {
+            treasureIndex[localTreasures[i]] = i;
+        }
+
+        int startMask = 0;
+        if (treasureIndex.ContainsKey(start))
+        {
+            startMask |= 1 << treasureIndex[start];
+        }
+
+        int goalMask = (1 << localTreasures.Count) - 1;
+        var startState = (location: start, mask: startMask);
+
+        Queue<(string location, int mask)> queue = new Queue<(string location, int mask)>();
+        HashSet<(string location, int mask)> visited = new HashSet<(string location, int mask)>();
+        Dictionary<(string location, int mask), PreviousLocationState> previous =
+            new Dictionary<(string location, int mask), PreviousLocationState>();
+
+        queue.Enqueue(startState);
+        visited.Add(startState);
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+
+            if (current.location == target && current.mask == goalMask)
+            {
+                return BuildLocationStateExitSequence(startState, current, previous);
+            }
+
+            if (!graph.ContainsKey(current.location))
+            {
+                continue;
+            }
+
+            foreach (LearnedRopeExit exit in graph[current.location].Values)
+            {
+                if (exit.Destination == null || exit.RopeCost != 0)
+                {
+                    continue;
+                }
+
+                if (!model.LocationToArea.ContainsKey(exit.Destination) ||
+                    model.LocationToArea[exit.Destination] != model.LocationToArea[start])
+                {
+                    continue;
+                }
+
+                int nextMask = current.mask;
+                if (treasureIndex.ContainsKey(exit.Destination))
+                {
+                    nextMask |= 1 << treasureIndex[exit.Destination];
+                }
+
+                var nextState = (location: exit.Destination, mask: nextMask);
+                if (visited.Contains(nextState))
+                {
+                    continue;
+                }
+
+                visited.Add(nextState);
+                previous[nextState] = new PreviousLocationState(
+                    current.location,
+                    current.mask,
+                    exit.Name
+                );
+                queue.Enqueue(nextState);
+            }
+        }
+
+        return null;
+    }
+
+    private List<string> BuildLocationStateExitSequence(
+        (string location, int mask) startState,
+        (string location, int mask) goalState,
+        Dictionary<(string location, int mask), PreviousLocationState> previous)
+    {
+        List<string> reversed = new List<string>();
+        var current = goalState;
+
+        while (!current.Equals(startState))
+        {
+            PreviousLocationState step = previous[current];
+            reversed.Add(step.ExitUsed);
+            current = (location: step.PreviousLocation, mask: step.PreviousMask);
+        }
+
+        reversed.Reverse();
+        return reversed;
+    }
+
+    private List<string>? FindNearestInternalTreasureRoute(
+        AreaModel model,
+        string start,
+        string target,
+        List<string> localTreasures)
+    {
+        List<string> fullRoute = new List<string>();
+        HashSet<string> remaining = new HashSet<string>(localTreasures);
+        string currentLocation = start;
+
+        remaining.Remove(currentLocation);
+
+        while (remaining.Count > 0)
+        {
+            string? nearestTreasure = null;
+            List<string>? bestSegment = null;
+
+            foreach (string treasure in remaining)
+            {
+                List<string>? segment = FindShortestZeroRopeExitSequence(model, currentLocation, treasure);
+                if (segment == null)
+                {
+                    continue;
+                }
+
+                if (bestSegment == null || segment.Count < bestSegment.Count)
+                {
+                    bestSegment = segment;
+                    nearestTreasure = treasure;
+                }
+            }
+
+            if (nearestTreasure == null || bestSegment == null)
+            {
+                return null;
+            }
+
+            foreach (string exit in bestSegment)
+            {
+                fullRoute.Add(exit);
+                string? destination = FindKnownDestination(currentLocation, exit);
+                if (destination == null)
+                {
+                    return null;
+                }
+
+                currentLocation = destination;
+                remaining.Remove(currentLocation);
+            }
+        }
+
+        List<string>? finalSegment = FindShortestZeroRopeExitSequence(model, currentLocation, target);
+        if (finalSegment == null)
+        {
+            return null;
+        }
+
+        foreach (string exit in finalSegment)
+        {
+            fullRoute.Add(exit);
+        }
+
+        return fullRoute;
+    }
+
+    private List<string>? FindShortestZeroRopeExitSequence(AreaModel model, string start, string goal)
+    {
+        if (start == goal)
+        {
+            return new List<string>();
+        }
+
+        if (!model.LocationToArea.ContainsKey(start) || !model.LocationToArea.ContainsKey(goal))
+        {
+            return null;
+        }
+
+        int area = model.LocationToArea[start];
+        if (model.LocationToArea[goal] != area)
+        {
+            return null;
+        }
+
+        Queue<string> queue = new Queue<string>();
+        HashSet<string> visited = new HashSet<string>();
+        Dictionary<string, PreviousLocationOnlyStep> previous = new Dictionary<string, PreviousLocationOnlyStep>();
+
+        queue.Enqueue(start);
+        visited.Add(start);
+
+        while (queue.Count > 0)
+        {
+            string current = queue.Dequeue();
+
+            if (!graph.ContainsKey(current))
+            {
+                continue;
+            }
+
+            foreach (LearnedRopeExit exit in graph[current].Values)
+            {
+                if (exit.Destination == null || exit.RopeCost != 0)
+                {
+                    continue;
+                }
+
+                if (!model.LocationToArea.ContainsKey(exit.Destination) ||
+                    model.LocationToArea[exit.Destination] != area)
+                {
+                    continue;
+                }
+
+                if (visited.Contains(exit.Destination))
+                {
+                    continue;
+                }
+
+                visited.Add(exit.Destination);
+                previous[exit.Destination] = new PreviousLocationOnlyStep(current, exit.Name);
+
+                if (exit.Destination == goal)
+                {
+                    return BuildExitSequence(start, goal, previous);
+                }
+
+                queue.Enqueue(exit.Destination);
+            }
+        }
+
+        return null;
+    }
+
+    private void AppendRouteAndUpdateTreasures(
+        List<string> fullRoute,
+        List<string> segment,
+        ref string currentLocation,
+        HashSet<string> remainingTreasures)
+    {
+        remainingTreasures.Remove(currentLocation);
+
+        foreach (string exit in segment)
+        {
+            fullRoute.Add(exit);
+            string? destination = FindKnownDestination(currentLocation, exit);
+            if (destination == null)
+            {
+                return;
+            }
+
+            currentLocation = destination;
+            remainingTreasures.Remove(currentLocation);
+        }
+    }
+
+    private List<string>? FindShortestKnownExitSequence(string start, string goal)
+    {
+        if (start == goal)
+        {
+            return new List<string>();
+        }
+
+        Queue<string> queue = new Queue<string>();
+        HashSet<string> visited = new HashSet<string>();
+        Dictionary<string, PreviousLocationOnlyStep> previousSteps =
+            new Dictionary<string, PreviousLocationOnlyStep>();
+
+        queue.Enqueue(start);
+        visited.Add(start);
+
+        while (queue.Count > 0)
+        {
+            string currentLocation = queue.Dequeue();
+
+            if (!graph.ContainsKey(currentLocation))
+            {
+                continue;
+            }
+
+            foreach (var exitEntry in graph[currentLocation])
+            {
+                string exit = exitEntry.Key;
+                string? destination = exitEntry.Value.Destination;
+
+                if (destination == null || visited.Contains(destination))
+                {
+                    continue;
+                }
+
+                visited.Add(destination);
+                previousSteps[destination] = new PreviousLocationOnlyStep(currentLocation, exit);
+
+                if (destination == goal)
+                {
+                    return BuildExitSequence(start, goal, previousSteps);
+                }
+
+                queue.Enqueue(destination);
+            }
+        }
+
+        return null;
+    }
+
+    private static List<string> BuildExitSequence(
+        string start,
+        string goal,
+        Dictionary<string, PreviousLocationOnlyStep> previousSteps)
+    {
+        List<string> reversedExitSequence = new List<string>();
+        string currentLocation = goal;
+
+        while (currentLocation != start)
+        {
+            PreviousLocationOnlyStep step = previousSteps[currentLocation];
+            reversedExitSequence.Add(step.ExitUsed);
+            currentLocation = step.PreviousLocation;
+        }
+
+        reversedExitSequence.Reverse();
+        return reversedExitSequence;
+    }
+
+    private string? FindKnownDestination(string location, string exit)
+    {
+        if (!graph.ContainsKey(location) || !graph[location].ContainsKey(exit))
+        {
+            return null;
+        }
+
+        return graph[location][exit].Destination;
+    }
+
+    private (string, string) ReturnActionAndRememberExit(
+        (string command, string exit) action,
+        RTBLocation currentLocation)
+    {
+        if (action.command == "go")
+        {
+            previousLocation = currentLocation.Name;
+            previousExit = action.exit;
+            previousRopeCost = FindRopeCostForExit(currentLocation, action.exit);
+            previousActionWasGo = true;
+        }
+        else
+        {
+            previousActionWasGo = false;
+        }
+
+        return action;
+    }
+
+    private int FindRopeCostForExit(RTBLocation location, string exitName)
+    {
+        foreach (RTBExit exit in location.Exits)
+        {
+            if (exit.Name == exitName)
+            {
+                return exit.RopeCost;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Tried to remember rope cost for non-existent exit {exitName} from {location.Name}."
+        );
+    }
+
+    private void EnsureLocationExists(string location)
+    {
+        if (!graph.ContainsKey(location))
+        {
+            graph[location] = new Dictionary<string, LearnedRopeExit>();
+        }
+    }
+
+    private class AreaModel
+    {
+        public List<List<string>> Areas;
+        public Dictionary<string, int> LocationToArea;
+        public List<AreaEdge> Edges;
+        public List<List<AreaEdge>> Adjacency;
+
+        public AreaModel()
+        {
+            Areas = new List<List<string>>();
+            LocationToArea = new Dictionary<string, int>();
+            Edges = new List<AreaEdge>();
+            Adjacency = new List<List<AreaEdge>>();
+        }
+
+        public int AreaCount
+        {
+            get { return Areas.Count; }
+        }
+    }
+
+    private class AreaTransition
+    {
+        public int FromArea;
+        public int ToArea;
+        public string FromLocation;
+        public string ExitName;
+        public string ToLocation;
+        public int RopeCost;
+
+        public AreaTransition(
+            int fromArea,
+            int toArea,
+            string fromLocation,
+            string exitName,
+            string toLocation,
+            int ropeCost)
+        {
+            FromArea = fromArea;
+            ToArea = toArea;
+            FromLocation = fromLocation;
+            ExitName = exitName;
+            ToLocation = toLocation;
+            RopeCost = ropeCost;
+        }
+    }
+
+    private class AreaEdge
+    {
+        public int Id;
+        public int AreaA;
+        public int AreaB;
+        public int RopeCost;
+        public AreaTransition AToB;
+        public AreaTransition BToA;
+
+        public AreaEdge(
+            int id,
+            int areaA,
+            int areaB,
+            int ropeCost,
+            AreaTransition aToB,
+            AreaTransition bToA)
+        {
+            Id = id;
+            AreaA = areaA;
+            AreaB = areaB;
+            RopeCost = ropeCost;
+            AToB = aToB;
+            BToA = bToA;
+        }
+
+        public int Other(int area)
+        {
+            if (area == AreaA)
+            {
+                return AreaB;
+            }
+
+            return AreaA;
+        }
+
+        public AreaTransition GetTransitionFrom(int area)
+        {
+            if (area == AreaA)
+            {
+                return AToB;
+            }
+
+            return BToA;
+        }
+    }
+
+    private class LearnedRopeExit
+    {
+        public string Name;
+        public int RopeCost;
+        public string? Destination;
+
+        public LearnedRopeExit(string name, int ropeCost, string? destination)
+        {
+            Name = name;
+            RopeCost = ropeCost;
+            Destination = destination;
+        }
+    }
+
+    private readonly struct PreviousLocationState
+    {
+        public readonly string PreviousLocation;
+        public readonly int PreviousMask;
+        public readonly string ExitUsed;
+
+        public PreviousLocationState(string previousLocation, int previousMask, string exitUsed)
+        {
+            PreviousLocation = previousLocation;
+            PreviousMask = previousMask;
+            ExitUsed = exitUsed;
+        }
+    }
+
+    private readonly struct PreviousLocationOnlyStep
+    {
+        public readonly string PreviousLocation;
+        public readonly string ExitUsed;
+
+        public PreviousLocationOnlyStep(string previousLocation, string exitUsed)
+        {
+            PreviousLocation = previousLocation;
+            ExitUsed = exitUsed;
+        }
+    }
+
+    private readonly struct AreaEdgeCost : IComparable<AreaEdgeCost>, IEquatable<AreaEdgeCost>
+    {
+        public readonly int RopeCost;
+        public readonly int TieBreaker;
+
+        public AreaEdgeCost(int ropeCost, int tieBreaker)
+        {
+            RopeCost = ropeCost;
+            TieBreaker = tieBreaker;
+        }
+
+        public int CompareTo(AreaEdgeCost other)
+        {
+            int ropeCompare = RopeCost.CompareTo(other.RopeCost);
+            if (ropeCompare != 0)
+            {
+                return ropeCompare;
+            }
+
+            return TieBreaker.CompareTo(other.TieBreaker);
+        }
+
+        public bool Equals(AreaEdgeCost other)
+        {
+            return RopeCost == other.RopeCost && TieBreaker == other.TieBreaker;
+        }
+
+        public override bool Equals(object? obj)
+        {
+            return obj is AreaEdgeCost other && Equals(other);
+        }
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(RopeCost, TieBreaker);
         }
     }
 }
