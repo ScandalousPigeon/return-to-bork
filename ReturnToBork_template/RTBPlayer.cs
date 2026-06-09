@@ -137,6 +137,9 @@ public class RTBPlayer
     }
 }
 
+/// <summary>
+/// Simple BFS implementation
+/// </summary>
 public class MazeSolver
 {
     private const long ExactStateLimit = 5000000;
@@ -771,6 +774,7 @@ public class MazeSolver
 /// <summary>
 /// Solves Trolls Any% by learning the full map, then finding a route from start
 /// to egress that minimises total troll toll. Ties are broken by fewer moves.
+/// Uses Dijkstra's Algorithm.
 /// </summary>
 public class TrollsAnyPercentChallenge
 {
