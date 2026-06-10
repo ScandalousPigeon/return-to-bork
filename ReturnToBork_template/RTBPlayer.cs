@@ -772,9 +772,7 @@ public class MazeSolver
 }
 
 /// <summary>
-/// Solves Trolls Any% by learning the full map, then finding a route from start
-/// to egress that minimises total troll toll. Ties are broken by fewer moves.
-/// Uses Dijkstra's Algorithm.
+/// Uses Dijkstra's Algorithm. Ties are broken by fewer moves.
 /// </summary>
 public class TrollsAnyPercentChallenge
 {
@@ -1215,6 +1213,7 @@ public class TrollsAnyPercentChallenge
 }
 
 /// <summary>
+/// Greedy Algorithm
 /// Solves Trolls 100% by learning the full map, compressing toll-free locations
 /// into areas, then planning an inter-area route that visits every treasure area
 /// before finishing at the egress. The final location route collects all known
